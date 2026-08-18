@@ -72,17 +72,27 @@ SECTOR_PEERS = {
 # -------------------------------------------------
 # Helpers
 # -------------------------------------------------
-@st.cache_data(ttl=100)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_data(ticker: str, period: str = "2y"):
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        hist = t.history(period=period, auto_adjust=True)
-        if hist.empty or len(hist) < 40:
-            return {"ok": False, "error": "Insufficient history"}
-        return {"ok": True, "info": info, "hist": hist}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    """Fetch with better rate-limit tolerance"""
+    import time
+    last_err = None
+    for attempt in range(3):
+        try:
+            t = yf.Ticker(ticker)
+            # Use fast_info first when possible to reduce load
+            hist = t.history(period=period, auto_adjust=True)
+            if hist.empty or len(hist) < 30:
+                return {"ok": False, "error": "No / insufficient price history for this ticker"}
+            info = t.info
+            return {"ok": True, "info": info, "hist": hist}
+        except Exception as e:
+            last_err = str(e)
+            if "Rate" in last_err or "Too Many" in last_err or "429" in last_err:
+                time.sleep(1.5 * (attempt + 1))  # backoff
+                continue
+            break
+    return {"ok": False, "error": last_err or "Unknown error"}
 
 def safe(d, *keys, default=None):
     cur = d
@@ -202,10 +212,20 @@ def detect_signals(df):
 
     return signals
 
-def support_resistance(df, lookback=60):
+def support_resistance(df, lookback=90):
+    """Return multiple practical technical levels"""
     recent = df.tail(lookback)
-    if recent.empty: return None, None
-    return recent["Low"].quantile(0.15), recent["High"].quantile(0.85)
+    if recent.empty or len(recent) < 20:
+        return None, None, None, None, None, None
+    # Classic support / resistance
+    support1 = recent["Low"].quantile(0.10)
+    support2 = recent["Low"].quantile(0.25)
+    resistance1 = recent["High"].quantile(0.75)
+    resistance2 = recent["High"].quantile(0.90)
+    # Recent swing levels
+    swing_low = recent["Low"].min()
+    swing_high = recent["High"].max()
+    return support1, support2, resistance1, resistance2, swing_low, swing_high
 
 # -------------------------------------------------
 # DCF + Monte-Carlo
@@ -357,7 +377,7 @@ st.info("🌐 **Works anywhere** — Open this link on any phone, tablet or lapt
 
 with st.sidebar:
     st.header("⚙️ Main Controls")
-    ticker_input = st.text_input("Main Ticker", value="RELIANCE.NS",
+    ticker_input = st.text_input("Main Ticker", value="TCS.NS",
                                  help="NSE: RELIANCE.NS | BSE: SBIN.BO | US: AAPL")
     ticker = ticker_input.upper().strip()
     period = st.selectbox("History", ["6mo", "1y", "2y", "5y"], index=2)
@@ -394,8 +414,20 @@ if analyze or st.session_state.last_ticker != ticker:
     data = fetch_data(ticker, period)
 
     if not data["ok"]:
-        st.error(f"Failed to load **{ticker}**: {data.get('error')}")
-        st.info("Use `.NS` for NSE, `.BO` for BSE. Examples: RELIANCE.NS, TCS.NS, HDFCBANK.NS, AAPL")
+        err_msg = data.get("error", "Unknown error")
+        st.error(f"Failed to load **{ticker}**: {err_msg}")
+        
+        if "Rate" in str(err_msg) or "Too Many" in str(err_msg):
+            st.warning("⏳ Yahoo Finance is rate-limiting requests right now. Please wait 30–60 seconds and click **Analyze** again.")
+        
+        st.info("""
+**Correct ticker format tips:**
+- NSE stocks → add `.NS`  (example: `RELIANCE.NS`, `TCS.NS`, `INFY.NS`, `HDFCBANK.NS`, `SBIN.NS`)
+- BSE stocks → add `.BO`  (example: `SBIN.BO`)
+- US stocks → no suffix (example: `AAPL`, `MSFT`, `GOOGL`)
+
+**Note:** Old ticker `HDFC.NS` no longer works. Use **`HDFCBANK.NS`** instead.
+""")
         st.stop()
 
     info = data["info"]
@@ -519,10 +551,33 @@ if analyze or st.session_state.last_ticker != ticker:
     elif upside < -mos: verdict = "🔴 OVERVALUED"
     else: verdict = "🟡 FAIRLY VALUED"
 
-    entry = fair * (1 - mos)
-    exit_base = fair * 1.08
-    exit_bull = fair * 1.25
-    support, resistance = support_resistance(hist)
+    # Fundamental targets (value investing)
+    entry_fund = fair * (1 - mos)
+    exit_base_fund = fair * 1.08
+    exit_bull_fund = fair * 1.25
+
+    # Technical levels (for trading around current price)
+    support1, support2, resistance1, resistance2, swing_low, swing_high = support_resistance(hist)
+    
+    # Practical Technical Entry / Exit near current price
+    last_close = float(hist["Close"].iloc[-1])
+    sma20 = float(hist["SMA_20"].iloc[-1]) if not np.isnan(hist["SMA_20"].iloc[-1]) else last_close
+    sma50 = float(hist["SMA_50"].iloc[-1]) if not np.isnan(hist["SMA_50"].iloc[-1]) else last_close
+    
+    # Technical Entry zones (buy near support)
+    tech_entry_aggressive = support1 if support1 else last_close * 0.97
+    tech_entry_conservative = support2 if support2 else last_close * 0.98
+    
+    # Technical Exit / Targets (sell near resistance)
+    tech_exit1 = resistance1 if resistance1 else last_close * 1.04
+    tech_exit2 = resistance2 if resistance2 else last_close * 1.08
+    tech_exit_swing = swing_high if swing_high else last_close * 1.12
+
+    # Keep old variable names for PDF compatibility
+    entry = tech_entry_conservative
+    exit_base = tech_exit1
+    exit_bull = tech_exit2
+    support, resistance = support1, resistance1
     signals = detect_signals(hist)
 
     # Tabs
@@ -556,11 +611,34 @@ if analyze or st.session_state.last_ticker != ticker:
             st.plotly_chart(fig_mc, use_container_width=True)
             st.caption(f"Based on {n_sims} simulations varying growth, WACC and terminal growth. Range shows uncertainty, not prediction.")
 
-        st.markdown("#### Entry / Exit Targets")
-        e1, e2, e3 = st.columns(3)
-        e1.write(f"**Entry ≤** {currency} {entry:.2f}")
-        e2.write(f"**Base Exit** {currency} {exit_base:.2f}")
-        e3.write(f"**Bull Exit** {currency} {exit_bull:.2f}")
+        st.markdown("#### 📍 Technical Entry / Exit Targets (for trading)")
+        st.caption("Based on Support, Resistance, Swing High/Low & Moving Averages — useful for short/medium term trades near current price.")
+        
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            st.markdown("**Buy / Entry Zones**")
+            st.write(f"Aggressive Entry: **{currency} {tech_entry_aggressive:.2f}**")
+            st.write(f"Conservative Entry: **{currency} {tech_entry_conservative:.2f}**")
+            st.write(f"Near SMA20: {currency} {sma20:.2f}")
+        with t2:
+            st.markdown("**Sell / Exit Targets**")
+            st.write(f"Target 1 (Resistance): **{currency} {tech_exit1:.2f}**")
+            st.write(f"Target 2 (Strong Res): **{currency} {tech_exit2:.2f}**")
+            st.write(f"Swing High Target: **{currency} {tech_exit_swing:.2f}**")
+        with t3:
+            st.markdown("**Key Levels**")
+            st.write(f"Support 1: {currency} {support1:.2f}" if support1 else "Support 1: N/A")
+            st.write(f"Support 2: {currency} {support2:.2f}" if support2 else "Support 2: N/A")
+            st.write(f"Resistance 1: {currency} {resistance1:.2f}" if resistance1 else "Res 1: N/A")
+            st.write(f"Current Price: **{currency} {price:.2f}**")
+
+        st.markdown("---")
+        st.markdown("#### 💰 Fundamental Entry / Exit (Value Investing)")
+        st.caption("Based on DCF fair value — use only if you are a long-term value investor.")
+        f1, f2, f3 = st.columns(3)
+        f1.write(f"**Fund. Entry ≤** {currency} {entry_fund:.2f}")
+        f2.write(f"**Fund. Base Exit** {currency} {exit_base_fund:.2f}")
+        f3.write(f"**Fund. Bull Exit** {currency} {exit_bull_fund:.2f}")
 
         # Scenarios
         scen = []
