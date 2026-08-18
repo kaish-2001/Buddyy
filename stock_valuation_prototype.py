@@ -72,24 +72,41 @@ SECTOR_PEERS = {
 # -------------------------------------------------
 # Helpers
 # -------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_data(ticker: str, period: str = "2y"):
-    """Fetch with better rate-limit tolerance"""
+
+@st.cache_data(ttl=600)
+def fetch_news(ticker):
+    """Fetch recent news headlines for the ticker via yfinance"""
+    try:
+        t = yf.Ticker(ticker)
+        news = t.news or []
+        items = []
+        for n in news[:8]:
+            title = n.get("title") or n.get("content", {}).get("title") or ""
+            publisher = n.get("publisher") or n.get("content", {}).get("provider", {}).get("displayName") or ""
+            link = n.get("link") or n.get("content", {}).get("clickThroughUrl", {}).get("url") or ""
+            if title:
+                items.append({"title": title, "publisher": publisher, "link": link})
+        return items
+    except Exception:
+        return []
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_data(ticker: str, period: str = "2y", interval: str = "1d"):
+    """Fetch with interval support + rate-limit tolerance"""
     import time
     last_err = None
     for attempt in range(3):
         try:
             t = yf.Ticker(ticker)
-            # Use fast_info first when possible to reduce load
-            hist = t.history(period=period, auto_adjust=True)
-            if hist.empty or len(hist) < 30:
-                return {"ok": False, "error": "No / insufficient price history for this ticker"}
+            hist = t.history(period=period, interval=interval, auto_adjust=True)
+            if hist.empty or len(hist) < 15:
+                return {"ok": False, "error": f"No / insufficient data for {interval} interval. Try a different timeframe."}
             info = t.info
             return {"ok": True, "info": info, "hist": hist}
         except Exception as e:
             last_err = str(e)
             if "Rate" in last_err or "Too Many" in last_err or "429" in last_err:
-                time.sleep(1.5 * (attempt + 1))  # backoff
+                time.sleep(1.5 * (attempt + 1))
                 continue
             break
     return {"ok": False, "error": last_err or "Unknown error"}
@@ -120,12 +137,18 @@ def fmt_pct(x):
 def add_technicals(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+    n = len(df)
 
-    df["SMA_20"] = ta.trend.sma_indicator(c, 20)
-    df["SMA_50"] = ta.trend.sma_indicator(c, 50)
-    df["SMA_200"] = ta.trend.sma_indicator(c, 200)
-    df["EMA_12"] = ta.trend.ema_indicator(c, 12)
-    df["EMA_26"] = ta.trend.ema_indicator(c, 26)
+    # Adaptive windows for short timeframes
+    w20 = min(20, max(5, n // 4))
+    w50 = min(50, max(8, n // 3))
+    w200 = min(200, max(15, n // 2))
+
+    df["SMA_20"] = ta.trend.sma_indicator(c, w20)
+    df["SMA_50"] = ta.trend.sma_indicator(c, w50)
+    df["SMA_200"] = ta.trend.sma_indicator(c, w200)
+    df["EMA_12"] = ta.trend.ema_indicator(c, min(12, max(3, n // 5)))
+    df["EMA_26"] = ta.trend.ema_indicator(c, min(26, max(5, n // 4)))
 
     macd = ta.trend.MACD(c)
     df["MACD"] = macd.macd()
@@ -176,6 +199,199 @@ def volume_profile(df, bins=24):
             vol_at_price[low_idx:high_idx+1] += row["Volume"] / (high_idx - low_idx + 1)
     centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     return centers, vol_at_price
+
+
+
+def calc_pivot_points(df):
+    """Classic Floor Pivot Points from last completed candle / day"""
+    if len(df) < 2:
+        return {}
+    # Use previous candle as reference (standard)
+    prev = df.iloc[-2]
+    h, l, c = float(prev["High"]), float(prev["Low"]), float(prev["Close"])
+    pp = (h + l + c) / 3
+    r1 = 2 * pp - l
+    s1 = 2 * pp - h
+    r2 = pp + (h - l)
+    s2 = pp - (h - l)
+    r3 = h + 2 * (pp - l)
+    s3 = l - 2 * (h - pp)
+    return {
+        "Pivot (PP)": pp,
+        "Resistance 1 (R1)": r1,
+        "Resistance 2 (R2)": r2,
+        "Resistance 3 (R3)": r3,
+        "Support 1 (S1)": s1,
+        "Support 2 (S2)": s2,
+        "Support 3 (S3)": s3,
+    }
+
+
+def calc_fibonacci_levels(df, lookback=60):
+    """Fibonacci retracement from recent swing high to swing low"""
+    recent = df.tail(lookback)
+    if recent.empty:
+        return {}
+    swing_high = float(recent["High"].max())
+    swing_low = float(recent["Low"].min())
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return {}
+    levels = {
+        "Swing High (0.0%)": swing_high,
+        "Fib 23.6%": swing_high - 0.236 * diff,
+        "Fib 38.2%": swing_high - 0.382 * diff,
+        "Fib 50.0%": swing_high - 0.500 * diff,
+        "Fib 61.8%": swing_high - 0.618 * diff,
+        "Fib 78.6%": swing_high - 0.786 * diff,
+        "Swing Low (100%)": swing_low,
+    }
+    return levels
+
+
+def calc_returns(df, price):
+    """Calculate returns over multiple periods"""
+    if df is None or len(df) < 2 or price is None:
+        return {}
+    close = df["Close"]
+    results = {}
+    periods = [
+        ("1 Day", 1),
+        ("1 Week", 5),
+        ("2 Weeks", 10),
+        ("1 Month", 21),
+        ("3 Months", 63),
+        ("6 Months", 126),
+        ("1 Year", 252),
+    ]
+    for label, bars in periods:
+        if len(close) > bars:
+            past = float(close.iloc[-bars-1])
+            if past > 0:
+                ret = (price - past) / past * 100
+                results[label] = ret
+    return results
+
+
+def detect_candlestick_patterns(df):
+    """Detect common candlestick patterns on the last few candles"""
+    patterns = []
+    if len(df) < 5:
+        return patterns
+
+    df = df.copy()
+    o, h, l, c = df["Open"], df["High"], df["Low"], df["Close"]
+    
+    # Last 3 candles
+    for i in [-1, -2, -3]:
+        body = abs(c.iloc[i] - o.iloc[i])
+        upper_wick = h.iloc[i] - max(c.iloc[i], o.iloc[i])
+        lower_wick = min(c.iloc[i], o.iloc[i]) - l.iloc[i]
+        full_range = h.iloc[i] - l.iloc[i]
+        if full_range == 0:
+            continue
+        body_ratio = body / full_range
+        is_bull = c.iloc[i] > o.iloc[i]
+        is_bear = c.iloc[i] < o.iloc[i]
+
+        # Doji
+        if body_ratio < 0.1:
+            patterns.append(("Doji", "Indecision / possible reversal", i))
+        # Hammer (bullish)
+        elif lower_wick > 2 * body and upper_wick < body * 0.5 and is_bull:
+            patterns.append(("Hammer", "Bullish reversal signal", i))
+        # Hanging Man (bearish)
+        elif lower_wick > 2 * body and upper_wick < body * 0.5 and is_bear:
+            patterns.append(("Hanging Man", "Bearish reversal warning", i))
+        # Shooting Star
+        elif upper_wick > 2 * body and lower_wick < body * 0.5 and is_bear:
+            patterns.append(("Shooting Star", "Bearish reversal signal", i))
+        # Inverted Hammer
+        elif upper_wick > 2 * body and lower_wick < body * 0.5 and is_bull:
+            patterns.append(("Inverted Hammer", "Potential bullish reversal", i))
+        # Marubozu
+        elif body_ratio > 0.85:
+            direction = "Bullish" if is_bull else "Bearish"
+            patterns.append((f"{direction} Marubozu", f"Strong {direction.lower()} momentum", i))
+
+    # Engulfing (need 2 candles)
+    if len(df) >= 2:
+        prev_body = abs(c.iloc[-2] - o.iloc[-2])
+        curr_body = abs(c.iloc[-1] - o.iloc[-1])
+        # Bullish Engulfing
+        if (c.iloc[-2] < o.iloc[-2] and c.iloc[-1] > o.iloc[-1] and
+            c.iloc[-1] > o.iloc[-2] and o.iloc[-1] < c.iloc[-2] and curr_body > prev_body):
+            patterns.append(("Bullish Engulfing", "Strong bullish reversal", -1))
+        # Bearish Engulfing
+        if (c.iloc[-2] > o.iloc[-2] and c.iloc[-1] < o.iloc[-1] and
+            c.iloc[-1] < o.iloc[-2] and o.iloc[-1] > c.iloc[-2] and curr_body > prev_body):
+            patterns.append(("Bearish Engulfing", "Strong bearish reversal", -1))
+
+    return patterns
+
+
+def detect_chart_patterns(df):
+    """Simple chart pattern detection on recent price action"""
+    patterns = []
+    if len(df) < 30:
+        return patterns
+
+    close = df["Close"].values
+    high = df["High"].values
+    low = df["Low"].values
+    n = len(close)
+
+    # Higher Highs / Higher Lows (Uptrend)
+    recent_highs = high[-20:]
+    recent_lows = low[-20:]
+    if recent_highs[-1] > recent_highs[-10] and recent_lows[-1] > recent_lows[-10]:
+        patterns.append(("Higher Highs + Higher Lows", "Uptrend structure intact", "Bullish"))
+    elif recent_highs[-1] < recent_highs[-10] and recent_lows[-1] < recent_lows[-10]:
+        patterns.append(("Lower Highs + Lower Lows", "Downtrend structure", "Bearish"))
+
+    # Double Bottom (simplified)
+    lows_idx = []
+    for i in range(n-25, n-2):
+        if low[i] < low[i-1] and low[i] < low[i+1]:
+            lows_idx.append(i)
+    if len(lows_idx) >= 2:
+        l1, l2 = lows_idx[-2], lows_idx[-1]
+        if abs(low[l1] - low[l2]) / low[l1] < 0.03 and (l2 - l1) > 5:
+            patterns.append(("Possible Double Bottom", "Bullish reversal pattern forming", "Bullish"))
+
+    # Double Top (simplified)
+    highs_idx = []
+    for i in range(n-25, n-2):
+        if high[i] > high[i-1] and high[i] > high[i+1]:
+            highs_idx.append(i)
+    if len(highs_idx) >= 2:
+        h1, h2 = highs_idx[-2], highs_idx[-1]
+        if abs(high[h1] - high[h2]) / high[h1] < 0.03 and (h2 - h1) > 5:
+            patterns.append(("Possible Double Top", "Bearish reversal pattern forming", "Bearish"))
+
+    # Breakout check
+    recent_range_high = high[-20:-1].max()
+    recent_range_low = low[-20:-1].min()
+    if close[-1] > recent_range_high:
+        patterns.append(("Breakout above recent range", "Bullish momentum / continuation", "Bullish"))
+    elif close[-1] < recent_range_low:
+        patterns.append(("Breakdown below recent range", "Bearish momentum / continuation", "Bearish"))
+
+    return patterns
+
+
+def timeframe_interpretation(interval, period, trade_horizon):
+    """Return human-friendly interpretation"""
+    interval_map = {
+        "15m": "15-Minute candles (scalping / very short-term)",
+        "1h": "1-Hour candles (intraday / short swing)",
+        "4h": "4-Hour candles (short to medium swing)",
+        "1d": "Daily candles (positional / swing)",
+        "1wk": "Weekly candles (medium to long-term trend)",
+        "1mo": "Monthly candles (long-term investment view)"
+    }
+    return f"{interval_map.get(interval, interval)} | History: {period} | Trading focus: {trade_horizon}"
+
 
 def detect_signals(df):
     signals = []
@@ -380,7 +596,30 @@ with st.sidebar:
     ticker_input = st.text_input("Main Ticker", value="TCS.NS",
                                  help="NSE: RELIANCE.NS | BSE: SBIN.BO | US: AAPL")
     ticker = ticker_input.upper().strip()
-    period = st.selectbox("History", ["6mo", "1y", "2y", "5y"], index=2)
+    st.markdown("**Chart Timeframe**")
+    interval = st.selectbox(
+        "Candle Interval",
+        ["15m", "1h", "4h", "1d", "1wk", "1mo"],
+        index=3,
+        help="15m/1h/4h = Intraday (limited history) | 1d = Daily | 1wk/1mo = Higher timeframe"
+    )
+    
+    # Auto-select suitable period based on interval
+    if interval in ["15m"]:
+        period = st.selectbox("History Length", ["5d", "15d", "30d", "60d"], index=2)
+    elif interval in ["1h", "4h"]:
+        period = st.selectbox("History Length", ["5d", "15d", "30d", "60d", "3mo"], index=2)
+    elif interval == "1d":
+        period = st.selectbox("History Length", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+    else:  # 1wk, 1mo
+        period = st.selectbox("History Length", ["6mo", "1y", "2y", "5y"], index=1)
+
+    st.markdown("**Trading Horizon**")
+    trade_horizon = st.selectbox(
+        "For trading decisions",
+        ["Intraday / Scalping", "7 Days (Short Swing)", "14 Days (Swing)", "30 Days (Positional)", "2 Months", "3-6 Months"],
+        index=2
+    )
 
     st.markdown("---")
     st.subheader("DCF / Monte-Carlo")
@@ -411,7 +650,7 @@ if "last_ticker" not in st.session_state:
 
 if analyze or st.session_state.last_ticker != ticker:
     st.session_state.last_ticker = ticker
-    data = fetch_data(ticker, period)
+    data = fetch_data(ticker, period, interval)
 
     if not data["ok"]:
         err_msg = data.get("error", "Unknown error")
@@ -525,6 +764,35 @@ if analyze or st.session_state.last_ticker != ticker:
             shares = man_shares if man_shares > 0 else shares
             st.success("✅ Manual values applied for this run.")
 
+
+
+    # ---------- Returns Calculator ----------
+    st.markdown("### 📈 Returns Calculator")
+    returns = calc_returns(hist, price)
+    if returns:
+        rcols = st.columns(len(returns))
+        for i, (label, ret) in enumerate(returns.items()):
+            color = "normal" if ret >= 0 else "inverse"
+            rcols[i].metric(label, f"{ret:+.2f}%")
+    else:
+        st.info("Not enough history to calculate returns.")
+
+    # ---------- News ----------
+    st.markdown("### 📰 Latest News")
+    news_items = fetch_news(ticker)
+    if news_items:
+        for item in news_items[:6]:
+            title = item.get("title", "")
+            pub = item.get("publisher", "")
+            link = item.get("link", "")
+            if link:
+                st.markdown(f"- [{title}]({link}) — _{pub}_")
+            else:
+                st.markdown(f"- **{title}** — _{pub}_")
+    else:
+        st.info("No recent news available for this ticker right now.")
+
+    st.markdown("---")
 
     # Valuation core
     if fcf is None or fcf <= 0:
@@ -653,11 +921,90 @@ if analyze or st.session_state.last_ticker != ticker:
     # ---- Tab 2: Technicals + Volume Profile ----
     with tabs[1]:
         st.subheader("Technical Indicators + Ichimoku + Volume Profile")
+        
+        # Timeframe interpretation
+        st.markdown(f"**Selected Timeframe:** {timeframe_interpretation(interval, period, trade_horizon)}")
+        
         if signals:
             for s, d in signals:
                 st.markdown(f"**{s}** — {d}")
         else:
             st.info("No major crossover signals.")
+
+        # ---- Candlestick Patterns ----
+        st.markdown("#### 🕯️ Live Candlestick Patterns")
+        candle_patterns = detect_candlestick_patterns(hist)
+        if candle_patterns:
+            for name, meaning, idx in candle_patterns:
+                candle_label = "Latest candle" if idx == -1 else f"{abs(idx)} candle(s) ago"
+                st.success(f"**{name}** ({candle_label}) — {meaning}")
+        else:
+            st.info("No strong candlestick patterns detected on recent candles.")
+
+        # ---- Chart Patterns ----
+        st.markdown("#### 📐 Chart Patterns Forming")
+        chart_patterns = detect_chart_patterns(hist)
+        if chart_patterns:
+            for name, meaning, bias in chart_patterns:
+                if bias == "Bullish":
+                    st.success(f"**{name}** — {meaning}")
+                elif bias == "Bearish":
+                    st.warning(f"**{name}** — {meaning}")
+                else:
+                    st.info(f"**{name}** — {meaning}")
+
+        else:
+            st.info("No clear chart pattern currently forming.")
+
+        # ---- Pivot Points ----
+        st.markdown("#### 🎯 Pivot Points (Classic)")
+        pivots = calc_pivot_points(hist)
+        if pivots:
+            pcols = st.columns(4)
+            keys = list(pivots.keys())
+            for i, k in enumerate(keys):
+                with pcols[i % 4]:
+                    st.metric(k, f"{pivots[k]:.2f}")
+        else:
+            st.info("Not enough data for pivot points.")
+
+        # ---- Fibonacci Levels ----
+        st.markdown("#### 📐 Fibonacci Retracement Levels")
+        fibs = calc_fibonacci_levels(hist)
+        if fibs:
+            fcols = st.columns(4)
+            for i, (k, v) in enumerate(fibs.items()):
+                with fcols[i % 4]:
+                    st.metric(k, f"{v:.2f}")
+            st.caption("Levels drawn from recent swing high to swing low. Price near 38.2% / 50% / 61.8% often acts as support/resistance.")
+        else:
+            st.info("Not enough data for Fibonacci levels.")
+
+        # ---- MA Crossover Status ----
+        st.markdown("#### 🔄 Moving Average Crossover Status")
+        last = hist.iloc[-1]
+        ma_status = []
+        if not np.isnan(last.get("SMA_20", np.nan)) and not np.isnan(last.get("SMA_50", np.nan)):
+            if last["SMA_20"] > last["SMA_50"]:
+                ma_status.append("SMA20 > SMA50 → Short-term bullish")
+            else:
+                ma_status.append("SMA20 < SMA50 → Short-term bearish")
+        if not np.isnan(last.get("SMA_50", np.nan)) and not np.isnan(last.get("SMA_200", np.nan)):
+            if last["SMA_50"] > last["SMA_200"]:
+                ma_status.append("SMA50 > SMA200 → Golden Cross zone (Long-term bullish)")
+            else:
+                ma_status.append("SMA50 < SMA200 → Death Cross zone (Long-term bearish)")
+        if not np.isnan(last.get("EMA_12", np.nan)) and not np.isnan(last.get("EMA_26", np.nan)):
+            if last["EMA_12"] > last["EMA_26"]:
+                ma_status.append("EMA12 > EMA26 → MACD line positive bias")
+            else:
+                ma_status.append("EMA12 < EMA26 → MACD line negative bias")
+        if ma_status:
+            for s in ma_status:
+                st.write(f"• {s}")
+        else:
+            st.info("MA data not available for crossover status.")
+
 
         t1, t2, t3, t4 = st.columns(4)
         t1.metric("RSI (14)", f"{last['RSI']:.1f}" if not np.isnan(last['RSI']) else "N/A")
