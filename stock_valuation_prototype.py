@@ -92,15 +92,32 @@ def fetch_news(ticker):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_data(ticker: str, period: str = "2y", interval: str = "1d"):
-    """Fetch with interval support + rate-limit tolerance"""
+    """Fetch with interval support + rate-limit tolerance.
+    Supports custom periods: 9mo, 3y, 4y by converting to start date.
+    """
     import time
+    from datetime import datetime, timedelta
     last_err = None
+
+    # Map non-standard periods to days
+    custom_days = {
+        "9mo": 270,
+        "3y": 365 * 3,
+        "4y": 365 * 4,
+    }
+
     for attempt in range(3):
         try:
             t = yf.Ticker(ticker)
-            hist = t.history(period=period, interval=interval, auto_adjust=True)
+            if period in custom_days:
+                end = datetime.now()
+                start = end - timedelta(days=custom_days[period])
+                hist = t.history(start=start, end=end, interval=interval, auto_adjust=True)
+            else:
+                hist = t.history(period=period, interval=interval, auto_adjust=True)
+
             if hist.empty or len(hist) < 15:
-                return {"ok": False, "error": f"No / insufficient data for {interval} interval. Try a different timeframe."}
+                return {"ok": False, "error": f"No / insufficient data for {interval} + {period}. Try Daily (1d) with longer history."}
             info = t.info
             return {"ok": True, "info": info, "hist": hist}
         except Exception as e:
@@ -601,18 +618,30 @@ with st.sidebar:
         "Candle Interval",
         ["15m", "1h", "4h", "1d", "1wk", "1mo"],
         index=3,
-        help="15m/1h/4h = Intraday (limited history) | 1d = Daily | 1wk/1mo = Higher timeframe"
+        help="15m/1h/4h = Intraday (limited history by Yahoo) | 1d/1wk/1mo = can go up to 5 years"
     )
     
-    # Auto-select suitable period based on interval
+    # History length depends on interval (Yahoo Finance limits intraday data)
     if interval in ["15m"]:
-        period = st.selectbox("History Length", ["5d", "15d", "30d", "60d"], index=2)
+        period = st.selectbox("History Length", ["5d", "15d", "30d", "60d"], index=2,
+                              help="Yahoo allows max ~60 days for 15-minute candles")
     elif interval in ["1h", "4h"]:
-        period = st.selectbox("History Length", ["5d", "15d", "30d", "60d", "3mo"], index=2)
+        period = st.selectbox("History Length", ["5d", "15d", "30d", "60d", "3mo", "6mo"], index=3,
+                              help="Yahoo allows limited history for hourly candles")
     elif interval == "1d":
-        period = st.selectbox("History Length", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+        period = st.selectbox(
+            "History Length",
+            ["3mo", "6mo", "9mo", "1y", "2y", "3y", "4y", "5y"],
+            index=3,
+            help="Daily candles support full 5-year history"
+        )
     else:  # 1wk, 1mo
-        period = st.selectbox("History Length", ["6mo", "1y", "2y", "5y"], index=1)
+        period = st.selectbox(
+            "History Length",
+            ["6mo", "1y", "2y", "3y", "4y", "5y"],
+            index=1,
+            help="Weekly/Monthly candles support full 5-year history"
+        )
 
     st.markdown("**Trading Horizon**")
     trade_horizon = st.selectbox(
